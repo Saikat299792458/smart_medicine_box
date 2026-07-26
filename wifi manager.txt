@@ -1,0 +1,23 @@
+#include <WiFiManager.h>
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000); // ← Give Serial time to initialize
+  
+  WiFiManager wm;
+  wm.setDebugOutput(true); // ← Add this line
+  
+  bool connected = wm.autoConnect("Bivob Medicine Box", "12345678");
+  
+  if (!connected) {
+    Serial.println("Failed to connect. Restarting...");
+    ESP.restart();
+  }
+  
+  Serial.println("Connected to WiFi!");
+  Serial.println(WiFi.localIP());
+}
+
+void loop() {
+  
+}

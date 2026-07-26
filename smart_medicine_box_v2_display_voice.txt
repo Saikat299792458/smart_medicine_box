@@ -1,0 +1,587 @@
+/*
+ * Bivob Smart Medicine Box v4 (FINAL)  —  ESP32-S3
+ * ---------------------------------------------------------------
+ * VOICE ANNOUNCEMENT SYSTEM:
+ *   AudioFileSourceHTTPStream only supports plain HTTP, and your
+ *   Railway server is HTTPS-only. So this version:
+ *     1. Downloads the TTS MP3 over HTTPS (WiFiClientSecure —
+ *        the same connection that already works for your API)
+ *     2. Stores it in PSRAM (you have 8MB free)
+ *     3. Plays it from memory via AudioFileSourcePROGMEM
+ *
+ * SERVER REQUIREMENT:
+ *   Your Railway FastAPI must have the /api/public/tts endpoint
+ *   (gTTS based) — see the snippet provided with this code.
+ *
+ * LIBRARIES REQUIRED:
+ *   - WiFiManager (tzapu)
+ *   - ArduinoJson (v7)
+ *   - Adafruit GFX + Adafruit SSD1306
+ *   - ESP8266Audio (Earle F. Philhower)
+ *
+ * ARDUINO IDE SETTINGS:
+ *   Tools > Partition Scheme > "Huge APP (3MB No OTA/1MB SPIFFS)"
+ *   Tools > PSRAM > "OPI PSRAM"
+ * ---------------------------------------------------------------
+ */
+
+#include <WiFiManager.h>
+#include <ArduinoJson.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+
+// ---- Audio ----
+#include <AudioFileSourcePROGMEM.h>
+#include <AudioGeneratorMP3.h>
+#include <AudioOutputI2S.h>
+
+// ================= PIN ASSIGNMENTS (ESP32-S3) =================
+#define OLED_SDA      17
+#define OLED_SCL      18
+#define BUTTON_PIN    16
+#define I2S_BCLK      15
+#define I2S_LRC       10
+#define I2S_DOUT      11
+#define STATUS_LED    12
+
+// ================= OLED SETTINGS =================
+#define SCREEN_WIDTH   128
+#define SCREEN_HEIGHT  64
+#define OLED_RESET     -1
+#define SCREEN_ADDRESS 0x3C
+TwoWire I2C_OLED = TwoWire(0);
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &I2C_OLED, OLED_RESET);
+
+// ================= BUTTON =================
+#define DEBOUNCE_DELAY 250
+
+// ================= API =================
+const char* apiBase = "https://hms-prodction-api.up.railway.app";
+const char* apiUrl =
+  "https://hms-prodction-api.up.railway.app/api/public/device-medicines?device_id=88888";
+
+// Max size for a downloaded TTS clip (PSRAM buffer)
+#define TTS_MAX_BYTES  (512 * 1024)   // 512KB, plenty for any sentence
+
+// ================= DATA STRUCTURES =================
+struct Alarm {
+  String alarm_time;
+  String repeat_type;
+  bool   enabled;
+};
+
+struct Medicine {
+  String id;
+  String medicine_name;
+  String generic_name;
+  String dosage;
+  bool   morning;
+  bool   noon;
+  bool   evening;
+  bool   night;
+  String meal_type;
+  String notes;
+  int    num_days;
+  String effective_till;
+  Alarm  alarms[6];
+  int    alarmCount;
+};
+
+struct Patient {
+  String   id;
+  String   patient_name;
+  int      age;
+  String   gender;
+  String   mobile;
+  String   relationship;
+  String   address;
+  Medicine medicines[10];
+  int      medicineCount;
+};
+
+// ================= GLOBALS =================
+Patient patients[5];
+int patientCount = 0;
+int currentPatientIndex = 0;
+int currentMedicineIndex = 0;
+unsigned long lastButtonPress = 0;
+bool dataLoaded = false;
+bool audioReady = false;
+
+// ---- Audio objects ----
+AudioGeneratorMP3       *mp3  = nullptr;
+AudioFileSourcePROGMEM  *file = nullptr;
+AudioOutputI2S          *out  = nullptr;
+bool audioPlaying = false;
+
+// PSRAM buffer holding the downloaded TTS MP3
+uint8_t *ttsBuffer = nullptr;
+size_t   ttsSize   = 0;
+
+// ================= PROTOTYPES =================
+bool fetchDataFromAPI();
+void parseJSONData(String &jsonString);
+void displayMedicineInfo();
+void displayPatientInfo();
+void nextMedicine();
+void setupDisplay();
+void setupButton();
+void setupAudio();
+void showMessage(String l1, String l2, String l3, int delayMs);
+void speak(const String &text);
+void announceCurrentMedicine();
+String urlEncode(const String &str);
+void serviceAudio();
+bool downloadTTS(const String &text);
+
+// =====================================================
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  pinMode(STATUS_LED, OUTPUT);
+  digitalWrite(STATUS_LED, LOW);
+
+  setupDisplay();
+  setupButton();
+
+  showMessage("Starting...", "Bivob MediBox", "", 1000);
+  showMessage("WiFi Setup", "Connect to AP:", "Bivob Medicine Box", 1500);
+
+  WiFiManager wm;
+  wm.setDebugOutput(false);
+  wm.setConnectTimeout(20);
+
+  bool connected = wm.autoConnect("Bivob Medicine Box", "12345678");
+  if (!connected) {
+    Serial.println("WiFi failed. Restarting...");
+    showMessage("WiFi Failed!", "Restarting...", "", 3000);
+    ESP.restart();
+  }
+
+  digitalWrite(STATUS_LED, HIGH);
+  Serial.print("Connected. IP: ");
+  Serial.println(WiFi.localIP());
+  showMessage("WiFi Connected!", WiFi.localIP().toString(), "Fetching Data...", 1500);
+
+  // ---- Allocate TTS buffer in PSRAM ----
+  ttsBuffer = (uint8_t *)ps_malloc(TTS_MAX_BYTES);
+  if (!ttsBuffer) {
+    Serial.println("WARNING: PSRAM alloc failed, TTS disabled");
+  }
+
+  // ---- Fetch with retry ----
+  bool ok = false;
+  for (int attempt = 1; attempt <= 3 && !ok; attempt++) {
+    Serial.printf("\n=== Fetch attempt %d/3 ===\n", attempt);
+    Serial.printf("Free heap before TLS: %d\n", ESP.getFreeHeap());
+    ok = fetchDataFromAPI();
+    if (!ok) {
+      showMessage("Retry " + String(attempt) + "/3", "Connecting...", "", 1500);
+      delay(1500);
+    }
+  }
+
+  setupAudio();
+
+  if (dataLoaded && patientCount > 0) {
+    showMessage("Data Loaded!", String(patientCount) + " Patient(s)", "", 1200);
+    displayPatientInfo();
+    delay(1500);
+    displayMedicineInfo();
+    announceCurrentMedicine();
+  } else {
+    showMessage("No Data Found!", "Check Connection", "Restart in 8s", 8000);
+    ESP.restart();
+  }
+}
+
+// =====================================================
+void loop() {
+  serviceAudio();
+
+  if (dataLoaded && patientCount > 0 && !audioPlaying) {
+    if (digitalRead(BUTTON_PIN) == LOW &&
+        (millis() - lastButtonPress) > DEBOUNCE_DELAY) {
+      lastButtonPress = millis();
+      nextMedicine();
+      announceCurrentMedicine();
+    }
+  }
+  delay(2);
+}
+
+// =====================================================
+void setupDisplay() {
+  I2C_OLED.begin(OLED_SDA, OLED_SCL, 400000);
+  if (!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
+    Serial.println(F("SSD1306 allocation failed"));
+    for (;;);
+  }
+  display.clearDisplay();
+  display.display();
+}
+
+void setupButton() {
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+}
+
+void setupAudio() {
+  out = new AudioOutputI2S(0, AudioOutputI2S::EXTERNAL_I2S);
+  out->SetPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
+  out->SetOutputModeMono(true);   // MAX98357A is mono
+  out->SetGain(0.9);
+  audioReady = true;
+  Serial.println("Audio initialized.");
+}
+
+// =====================================================
+void showMessage(String l1, String l2, String l3, int delayMs) {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 10); display.println(l1);
+  display.setCursor(0, 25); display.println(l2);
+  display.setCursor(0, 40); display.println(l3);
+  display.display();
+  delay(delayMs);
+}
+
+// =====================================================
+bool fetchDataFromAPI() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi not connected!");
+    showMessage("WiFi Error", "Not Connected", "", 2000);
+    return false;
+  }
+
+  Serial.println("Fetching from API:");
+  Serial.println(apiUrl);
+  showMessage("Fetching Data", "Please wait...", "", 300);
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setHandshakeTimeout(30);
+  client.setTimeout(20000);
+
+  HTTPClient http;
+  http.begin(client, apiUrl);
+  http.setReuse(false);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  http.addHeader("Accept", "application/json");
+  http.addHeader("User-Agent", "Mozilla/5.0 (ESP32)");
+  http.setTimeout(20000);
+
+  int httpCode = http.GET();
+  Serial.printf("HTTP Response Code: %d\n", httpCode);
+
+  if (httpCode == HTTP_CODE_OK) {
+    String payload = http.getString();
+    Serial.printf("Payload length: %d\n", payload.length());
+
+    if (payload.length() > 0) {
+      parseJSONData(payload);
+      http.end();
+      return dataLoaded;
+    } else {
+      Serial.println("Empty response");
+      showMessage("API Error", "Empty Response", "", 2000);
+    }
+  } else {
+    Serial.printf("HTTP GET failed: %s\n", http.errorToString(httpCode).c_str());
+    showMessage("API Error", "HTTP " + String(httpCode),
+                http.errorToString(httpCode), 2000);
+  }
+  http.end();
+  return false;
+}
+
+// =====================================================
+void parseJSONData(String &jsonString) {
+  Serial.println("Parsing JSON...");
+
+  if (jsonString.indexOf("\"patients\"") == -1) {
+    Serial.println("No 'patients' key found");
+    dataLoaded = false;
+    return;
+  }
+
+  JsonDocument doc;
+  DeserializationError error = deserializeJson(doc, jsonString);
+  if (error) {
+    Serial.print(F("deserializeJson failed: "));
+    Serial.println(error.f_str());
+    dataLoaded = false;
+    return;
+  }
+
+  if (!doc["patients"].is<JsonArray>()) {
+    Serial.println("No 'patients' array");
+    dataLoaded = false;
+    return;
+  }
+
+  JsonArray patientsArray = doc["patients"];
+  patientCount = patientsArray.size();
+  Serial.printf("Found %d patients\n", patientCount);
+  if (patientCount == 0) { dataLoaded = false; return; }
+  if (patientCount > 5) patientCount = 5;
+
+  for (int i = 0; i < patientCount; i++) {
+    JsonObject p = patientsArray[i];
+    patients[i].id           = p["id"]           | "";
+    patients[i].patient_name = p["patient_name"] | "Unknown";
+    patients[i].age          = p["age"]          | 0;
+    patients[i].gender       = p["gender"]       | "";
+    patients[i].mobile       = p["mobile"]       | "";
+    patients[i].relationship = p["relationship"] | "";
+    patients[i].address      = p["address"]      | "";
+
+    Serial.printf("Patient %d: %s (Age %d)\n",
+                  i + 1, patients[i].patient_name.c_str(), patients[i].age);
+
+    JsonArray meds = p["medicines"];
+    patients[i].medicineCount = meds.size();
+    if (patients[i].medicineCount > 10) patients[i].medicineCount = 10;
+
+    for (int j = 0; j < patients[i].medicineCount; j++) {
+      JsonObject m = meds[j];
+      Medicine &md = patients[i].medicines[j];
+      md.id            = m["id"]            | "";
+      md.medicine_name = m["medicine_name"] | "Unknown";
+      md.generic_name  = m["generic_name"]  | "";
+      md.dosage        = m["dosage"]        | "";
+      md.morning       = m["morning"]       | false;
+      md.noon          = m["noon"]          | false;
+      md.evening       = m["evening"]       | false;
+      md.night         = m["night"]         | false;
+      md.meal_type     = m["meal_type"]     | "";
+      md.notes         = m["notes"]         | "";
+      md.num_days      = m["num_days"]      | 0;
+      md.effective_till= m["effective_till"]| "";
+
+      JsonArray al = m["alarms"];
+      md.alarmCount = al.size();
+      if (md.alarmCount > 6) md.alarmCount = 6;
+      for (int k = 0; k < md.alarmCount; k++) {
+        md.alarms[k].alarm_time  = al[k]["alarm_time"]  | "";
+        md.alarms[k].repeat_type = al[k]["repeat_type"] | "";
+        md.alarms[k].enabled     = al[k]["enabled"]     | false;
+      }
+    }
+  }
+
+  dataLoaded = true;
+  Serial.println("JSON parsing complete.");
+}
+
+// =====================================================
+void displayMedicineInfo() {
+  if (!dataLoaded || patientCount == 0) return;
+
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  display.setCursor(0, 0);
+  display.print("Patient: ");
+  display.println(patients[currentPatientIndex].patient_name);
+  display.drawLine(0, 10, SCREEN_WIDTH, 10, SSD1306_WHITE);
+
+  Medicine &med = patients[currentPatientIndex].medicines[currentMedicineIndex];
+
+  display.setCursor(0, 16);
+  display.print(med.medicine_name);
+
+  display.setCursor(0, 28);
+  display.print("Dosage: ");
+  display.println(med.dosage);
+
+  if (med.meal_type.length() > 0 && med.meal_type != "null") {
+    display.setCursor(0, 40);
+    display.print(med.meal_type);
+  }
+
+  display.setCursor(0, 52);
+  display.print("Sch: ");
+  if (med.morning) display.print("M ");
+  if (med.noon)    display.print("N ");
+  if (med.evening) display.print("E ");
+  if (med.night)   display.print("Ngt");
+
+  char progress[10];
+  sprintf(progress, "%d/%d", currentMedicineIndex + 1,
+          patients[currentPatientIndex].medicineCount);
+  display.setCursor(SCREEN_WIDTH - 30, SCREEN_HEIGHT - 8);
+  display.print(progress);
+
+  display.display();
+}
+
+// =====================================================
+void displayPatientInfo() {
+  if (!dataLoaded || patientCount == 0) return;
+
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+  display.setCursor(0, 0);  display.println("=== PATIENT INFO ===");
+  display.setCursor(0, 12); display.print("Name: ");
+  display.println(patients[currentPatientIndex].patient_name);
+
+  display.setCursor(0, 24); display.print("Age: ");
+  display.print(String(patients[currentPatientIndex].age));
+  display.print("  ");
+  display.println(patients[currentPatientIndex].gender);
+
+  display.setCursor(0, 38); display.print("Medicines: ");
+  display.println(String(patients[currentPatientIndex].medicineCount));
+
+  display.setCursor(0, 52); display.print("Press button");
+  display.display();
+}
+
+// =====================================================
+void nextMedicine() {
+  currentMedicineIndex++;
+  if (currentMedicineIndex >= patients[currentPatientIndex].medicineCount) {
+    currentMedicineIndex = 0;
+    currentPatientIndex++;
+    if (currentPatientIndex >= patientCount) currentPatientIndex = 0;
+    displayPatientInfo();
+    delay(1200);
+  }
+  displayMedicineInfo();
+}
+
+// =====================================================
+// ===============  VOICE / TTS SECTION  ===============
+// =====================================================
+void announceCurrentMedicine() {
+  if (!dataLoaded || patientCount == 0 || !audioReady) return;
+  Patient  &pt  = patients[currentPatientIndex];
+  Medicine &med = pt.medicines[currentMedicineIndex];
+
+  // Example spoken sentence:
+  // "Ismail, take Napa 500mg, dosage 1, After Meal"
+  String sentence = pt.patient_name + ", take " +
+                    med.medicine_name + ", dosage " + med.dosage;
+  if (med.meal_type.length() > 0 && med.meal_type != "null") {
+    sentence += ", " + med.meal_type;
+  }
+
+  Serial.println("Speaking: " + sentence);
+  speak(sentence);
+}
+
+// Download TTS MP3 from Railway over HTTPS into PSRAM buffer
+bool downloadTTS(const String &text) {
+  if (!ttsBuffer) return false;
+
+  String url = String(apiBase) + "/api/public/tts?text=" + urlEncode(text);
+  Serial.println("TTS URL: " + url);
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setHandshakeTimeout(30);
+  client.setTimeout(20000);
+
+  HTTPClient http;
+  http.begin(client, url);
+  http.setTimeout(20000);
+  http.addHeader("User-Agent", "Mozilla/5.0 (ESP32)");
+
+  int httpCode = http.GET();
+  Serial.printf("TTS HTTP Code: %d\n", httpCode);
+
+  if (httpCode != HTTP_CODE_OK) {
+    Serial.printf("TTS download failed: %s\n",
+                  http.errorToString(httpCode).c_str());
+    http.end();
+    return false;
+  }
+
+  // Read the MP3 body into PSRAM
+  int contentLen = http.getSize();   // may be -1 (chunked)
+  WiFiClient *stream = http.getStreamPtr();
+  ttsSize = 0;
+
+  unsigned long lastRead = millis();
+  while (http.connected() && (millis() - lastRead) < 5000) {
+    size_t avail = stream->available();
+    if (avail) {
+      if (ttsSize + avail > TTS_MAX_BYTES) avail = TTS_MAX_BYTES - ttsSize;
+      int got = stream->readBytes(ttsBuffer + ttsSize, avail);
+      ttsSize += got;
+      lastRead = millis();
+      if (ttsSize >= TTS_MAX_BYTES) break;
+      if (contentLen > 0 && (int)ttsSize >= contentLen) break;
+    } else {
+      delay(5);
+    }
+  }
+  http.end();
+
+  Serial.printf("TTS downloaded: %d bytes\n", ttsSize);
+  return ttsSize > 0;
+}
+
+// Speak: download MP3 to PSRAM, then play from memory
+void speak(const String &text) {
+  if (!audioReady) { Serial.println("Audio not ready"); return; }
+
+  // Stop/clean any previous playback
+  if (mp3 && mp3->isRunning()) mp3->stop();
+  if (file) { delete file; file = nullptr; }
+  if (mp3)  { delete mp3;  mp3  = nullptr; }
+
+  if (!downloadTTS(text)) {
+    Serial.println("TTS download failed — no announcement");
+    return;
+  }
+
+  file = new AudioFileSourcePROGMEM(ttsBuffer, ttsSize);
+  mp3  = new AudioGeneratorMP3();
+
+  if (mp3->begin(file, out)) {
+    Serial.println("Announcement playing...");
+    audioPlaying = true;
+  } else {
+    Serial.println("MP3 begin failed");
+    audioPlaying = false;
+  }
+}
+
+void serviceAudio() {
+  if (mp3 && mp3->isRunning()) {
+    if (!mp3->loop()) {
+      mp3->stop();
+      audioPlaying = false;
+      Serial.println("Announcement finished.");
+    }
+  } else {
+    audioPlaying = false;
+  }
+}
+
+String urlEncode(const String &str) {
+  String encoded = "";
+  char c;
+  char buf[4];
+  for (unsigned int i = 0; i < str.length(); i++) {
+    c = str.charAt(i);
+    if (isalnum(c)) {
+      encoded += c;
+    } else if (c == ' ') {
+      encoded += "%20";
+    } else {
+      sprintf(buf, "%%%02X", (unsigned char)c);
+      encoded += buf;
+    }
+  }
+  return encoded;
+}

@@ -1,0 +1,84 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+const char* ssid = "Valhalla";
+const char* password = "Faisal0101";
+
+void setup() {
+
+  Serial.begin(115200);
+
+  // OLED I2C
+  Wire.begin(8, 9);
+
+  // OLED Start
+  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("OLED failed");
+    while(true);
+  }
+
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
+
+  display.setCursor(0,0);
+  display.println("Connecting WiFi");
+  display.display();
+
+  // WiFi Connect
+  WiFi.begin(ssid, password);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+  }
+
+  display.clearDisplay();
+  display.setCursor(0,0);
+  display.println("WiFi Connected");
+  display.display();
+
+  // HTTP Request
+  HTTPClient http;
+
+  http.begin("https://jsonplaceholder.typicode.com/todos/1");
+
+  int httpCode = http.GET();
+
+  if (httpCode > 0) {
+
+    String payload = http.getString();
+
+    Serial.println(payload);
+
+    display.clearDisplay();
+
+    display.setCursor(0,0);
+    display.println("Data Received:");
+
+    display.println(payload.substring(0, 60));
+
+    display.display();
+  }
+  else {
+
+    display.clearDisplay();
+    display.setCursor(0,0);
+    display.println("HTTP Error");
+    display.display();
+  }
+
+  http.end();
+}
+
+void loop() {
+
+}
